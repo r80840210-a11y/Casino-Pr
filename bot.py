@@ -46,7 +46,7 @@ class PromoStates(StatesGroup):
     waiting_for_code = State()
 
 class AdminStates(StatesGroup):
-    waiting_for_add_admin = State()
+    waiting_for_add_admin_id = State()
     waiting_for_del_admin = State()
     waiting_for_ban_user = State()
     waiting_for_unban_user = State()
@@ -73,10 +73,11 @@ async def init_db():
                 is_banned INTEGER DEFAULT 0
             )
         ''')
-        # Админы
+        # Админы с уровнем доступа (super = старший, junior = младший)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY
+                user_id INTEGER PRIMARY KEY,
+                role TEXT DEFAULT 'junior'
             )
         ''')
         # Промокоды
@@ -103,19 +104,20 @@ async def init_db():
             )
         ''')
 
-        # Дефолтный админ
-        await db.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (INITIAL_ADMIN_ID,))
+        # Главный админ (всегда super)
+        await db.execute('INSERT OR REPLACE INTO admins (user_id, role) VALUES (?, ?)', (INITIAL_ADMIN_ID, 'super'))
         # Дефолтный минимальный вывод
         await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('min_withdraw', '100'))
         
         await db.commit()
 
-async def is_admin(user_id: int) -> bool:
+async def get_admin_role(user_id: int):
     if user_id == INITIAL_ADMIN_ID:
-        return True
+        return 'super'
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
+        async with db.execute('SELECT role FROM admins WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
 async def is_banned(user_id: int) -> bool:
     async with aiosqlite.connect(DB_NAME) as db:
@@ -209,7 +211,7 @@ async def donate_stars(message: Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# --- Вкладка Апгрейд Звезд (Казино) ---
+# --- Вкладка Апгрейд Звезд (Казино х2) ---
 @router.message(F.text == "⭐ Апгрейд звезд")
 async def upgrade_stars_start(message: Message, state: FSMContext):
     if await is_banned(message.from_user.id):
@@ -224,7 +226,7 @@ async def upgrade_stars_start(message: Message, state: FSMContext):
 
     await state.set_state(GameStates.waiting_for_bet)
     await message.answer(
-        f"🎰 <b>Апгрейд звезд</b>\n\n"
+        f"🎰 <b>Апгрейд звезд (Множитель x2)</b>\n\n"
         f"Ваш текущий баланс: <b>{balance} ⭐</b>\n\n"
         f"Введите количество звезд, которое хотите поставить на апгрейд:"
     , parse_mode="HTML")
@@ -247,12 +249,12 @@ async def process_bet(message: Message, state: FSMContext):
         await message.answer(f"❌ У вас недостаточно звезд! Ваш баланс: {balance} ⭐.")
         return
 
-    # Логика подкрутки: шанс выигрыша 35% (больше проигрышей)
+    # Логика подкрутки: шанс выигрыша 35% (больше проигрышей), множитель x2
     win = random.random() < 0.35
 
     async with aiosqlite.connect(DB_NAME) as db:
         if win:
-            multiplier = 1.8
+            multiplier = 2.0
             win_amount = int(bet * multiplier)
             profit = win_amount - bet
             await db.execute(
@@ -263,7 +265,7 @@ async def process_bet(message: Message, state: FSMContext):
             new_balance = balance + profit
             await message.answer(
                 f"🎉 <b>ПОБЕДА!</b>\n\n"
-                f"Вы выиграли {win_amount} ⭐ (x{multiplier})!\n"
+                f"Вы выиграли {win_amount} ⭐ (x2)!\n"
                 f"Твой новый баланс: <b>{new_balance} ⭐</b>",
                 parse_mode="HTML"
             )
@@ -378,44 +380,85 @@ async def process_promo(message: Message, state: FSMContext):
     await message.answer(f"🎉 Промокод успешно активирован! Вам начислено <b>+{reward} ⭐</b>!", parse_mode="HTML")
     await state.clear()
 
-# --- АДМИН ПАНЕЛЬ ---
+# --- АДМИН ПАНЕЛЬ С РОЛЯМИ (Старший / Младший) ---
 @router.message(F.text == "⚙️ Админ панель")
 async def admin_panel(message: Message):
-    if not await is_admin(message.from_user.id):
+    role = await get_admin_role(message.from_user.id)
+    if not role:
         return
 
-    text = "⚙️ <b>Панель администратора:</b>"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add"), InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_del")],
+    role_title = "🔴 Старший админ" if role == "super" else "🔵 Младший админ"
+    text = f"⚙️ <b>Панель администратора ({role_title}):</b>"
+
+    buttons = []
+    if role == "super":
+        buttons.append([
+            InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add"),
+            InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_del")
+        ])
+
+    buttons.extend([
         [InlineKeyboardButton(text="🚫 Забанить", callback_data="admin_ban"), InlineKeyboardButton(text="🟢 Разбанить", callback_data="admin_unban")],
         [InlineKeyboardButton(text="➕ Выдать звезды", callback_data="admin_give"), InlineKeyboardButton(text="➖ Забрать звезды", callback_data="admin_take")],
         [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_promo"), InlineKeyboardButton(text="⚙️ Мин. вывод", callback_data="admin_min_withdraw")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
     ])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
-# Добавить админа
+# Выбор роли при добавлении админа (Доступно только Старшему Админу)
 @router.callback_query(F.data == "admin_add")
 async def admin_add_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
-    await state.set_state(AdminStates.waiting_for_add_admin)
+    role = await get_admin_role(call.from_user.id)
+    if role != "super":
+        await call.answer("❌ Функция доступна только Старшему Администратору!", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_add_admin_id)
     await call.message.answer("Введите ID пользователя для назначения админом:")
     await call.answer()
 
-@router.message(AdminStates.waiting_for_add_admin)
-async def process_admin_add(message: Message, state: FSMContext):
+@router.message(AdminStates.waiting_for_add_admin_id)
+async def process_admin_add_id(message: Message, state: FSMContext):
     if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
     uid = int(message.text)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (uid,))
-        await db.commit()
-    await message.answer(f"✅ Пользователь {uid} назначен администратором.")
-    await state.clear()
+    await state.update_data(new_admin_id=uid)
 
-# Удалить админа
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔴 Старший админ (Всё)", callback_data="set_role_super")],
+        [InlineKeyboardButton(text="🔵 Младший админ (Без добавления/удаления)", callback_data="set_role_junior")]
+    ])
+    await message.answer(f"Выберите уровень прав для пользователя <code>{uid}</code>:", parse_mode="HTML", reply_markup=kb)
+
+@router.callback_query(F.data.in_({"set_role_super", "set_role_junior"}))
+async def process_admin_role_select(call: CallbackQuery, state: FSMContext):
+    role_to_set = "super" if call.data == "set_role_super" else "junior"
+    data = await state.get_data()
+    uid = data.get('new_admin_id')
+
+    if not uid:
+        await call.message.answer("❌ Ошибка получения ID.")
+        await state.clear()
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR REPLACE INTO admins (user_id, role) VALUES (?, ?)', (uid, role_to_set))
+        await db.commit()
+
+    role_text = "Старший администратор" if role_to_set == "super" else "Младший администратор"
+    await call.message.answer(f"✅ Пользователь <code>{uid}</code> назначен как <b>{role_text}</b>.", parse_mode="HTML")
+    await state.clear()
+    await call.answer()
+
+# Удалить админа (Доступно только Старшему Админу)
 @router.callback_query(F.data == "admin_del")
 async def admin_del_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    role = await get_admin_role(call.from_user.id)
+    if role != "super":
+        await call.answer("❌ Функция доступна только Старшему Администратору!", show_alert=True)
+        return
+
     await state.set_state(AdminStates.waiting_for_del_admin)
     await call.message.answer("Введите ID админа для удаления:")
     await call.answer()
@@ -425,7 +468,7 @@ async def process_admin_del(message: Message, state: FSMContext):
     if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
     uid = int(message.text)
     if uid == INITIAL_ADMIN_ID:
-        await message.answer("❌ Нельзя удалить главный ID!")
+        await message.answer("❌ Нельзя удалить главного владельца!")
         await state.clear()
         return
     async with aiosqlite.connect(DB_NAME) as db:
@@ -437,7 +480,7 @@ async def process_admin_del(message: Message, state: FSMContext):
 # Забанить
 @router.callback_query(F.data == "admin_ban")
 async def admin_ban_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_ban_user)
     await call.message.answer("Введите ID пользователя для бана:")
     await call.answer()
@@ -455,7 +498,7 @@ async def process_admin_ban(message: Message, state: FSMContext):
 # Разбанить
 @router.callback_query(F.data == "admin_unban")
 async def admin_unban_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_unban_user)
     await call.message.answer("Введите ID пользователя для разбана:")
     await call.answer()
@@ -473,7 +516,7 @@ async def process_admin_unban(message: Message, state: FSMContext):
 # Выдать звезды
 @router.callback_query(F.data == "admin_give")
 async def admin_give_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_give_stars_user)
     await call.message.answer("Введите ID пользователя для выдачи звезд:")
     await call.answer()
@@ -502,7 +545,7 @@ async def process_give_amount(message: Message, state: FSMContext):
 # Забрать звезды
 @router.callback_query(F.data == "admin_take")
 async def admin_take_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_take_stars_user)
     await call.message.answer("Введите ID пользователя для списания звезд:")
     await call.answer()
@@ -531,7 +574,7 @@ async def process_take_amount(message: Message, state: FSMContext):
 # Создание промокода
 @router.callback_query(F.data == "admin_promo")
 async def admin_promo_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_promo_name)
     await call.message.answer("Введите название нового промокода:")
     await call.answer()
@@ -567,7 +610,7 @@ async def process_promo_stars(message: Message, state: FSMContext):
 # Установить мин. вывод
 @router.callback_query(F.data == "admin_min_withdraw")
 async def admin_min_w_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_min_withdraw)
     cur_min = await get_min_withdraw()
     await call.message.answer(f"Текущий минимальный вывод: {cur_min} ⭐\nВведите новое значение минимального вывода:")
@@ -588,7 +631,7 @@ async def process_min_w(message: Message, state: FSMContext):
 # Рассылка
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_cb(call: CallbackQuery, state: FSMContext):
-    if not await is_admin(call.from_user.id): return
+    if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_broadcast)
     await call.message.answer("Введите сообщение для рассылки всем пользователям:")
     await call.answer()
