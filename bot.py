@@ -38,6 +38,9 @@ dp.include_router(router)
 class GameStates(StatesGroup):
     waiting_for_bet = State()
 
+class TowerStates(StatesGroup):
+    waiting_for_bet = State()
+
 class WithdrawStates(StatesGroup):
     waiting_for_amount = State()
     waiting_for_address = State()
@@ -165,7 +168,8 @@ def main_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎮 Играть"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="💳 Задонатить звезды"), KeyboardButton(text="⚙️ Админ панель")]
+            [KeyboardButton(text="💳 Задонатить звезды"), KeyboardButton(text="📊 Статистика бота")],
+            [KeyboardButton(text="⚙️ Админ панель")]
         ],
         resize_keyboard=True
     )
@@ -182,7 +186,7 @@ async def cmd_start(message: Message, state: FSMContext):
     
     welcome_text = (
         f"👋 Добро пожаловать в ⭐ Stars Casino!\n\n"
-        f"Здесь вы можете испытывать удачу!\n"
+        f"Здесь вы можете испытывать удачу и играть в режиме Башня!\n"
         f"Используйте меню ниже для навигации."
     )
     await message.answer(welcome_text, reply_markup=main_kb())
@@ -230,6 +234,41 @@ async def donate_stars(message: Message):
     )
     await message.answer(text, parse_mode="HTML")
 
+# --- Вкладка Статистика Бота ---
+@router.message(F.text == "📊 Статистика бота")
+async def bot_statistics(message: Message):
+    if await is_banned(message.from_user.id):
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Всего юзеров на базе
+        async with db.execute('SELECT COUNT(*) FROM users') as cursor:
+            total_users = (await cursor.fetchone())[0]
+
+        # Сумма всех балансов на руках
+        async with db.execute('SELECT SUM(balance) FROM users') as cursor:
+            total_balance_row = await cursor.fetchone()
+            total_balance = total_balance_row[0] if total_balance_row[0] else 0
+
+        # Общая сумма успешных выводов
+        async with db.execute('SELECT SUM(amount) FROM withdrawals WHERE status = "accepted"') as cursor:
+            total_withdrawn_row = await cursor.fetchone()
+            total_withdrawn = total_withdrawn_row[0] if total_withdrawn_row[0] else 0
+
+        # Всего сыгранных игр (побед + поражений)
+        async with db.execute('SELECT SUM(wins + losses) FROM users') as cursor:
+            total_games_row = await cursor.fetchone()
+            total_games = total_games_row[0] if total_games_row[0] else 0
+
+    text = (
+        f"📊 <b>Статистика проекта Stars Casino:</b>\n\n"
+        f"👥 Пользователей в базе: <b>{total_users}</b>\n"
+        f"🎮 Всего сыграно игр: <b>{total_games}</b>\n"
+        f"⭐ Звезд на руках у игроков: <b>{total_balance} ⭐</b>\n"
+        f"📤 Всего успешно выведено: <b>{total_withdrawn} ⭐</b>"
+    )
+    await message.answer(text, parse_mode="HTML")
+
 # --- Меню Игр (Вкладка "Играть") ---
 @router.message(F.text == "🎮 Играть")
 async def games_menu(message: Message):
@@ -237,11 +276,12 @@ async def games_menu(message: Message):
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Апгрейд звезд", callback_data="game_upgrade")]
+        [InlineKeyboardButton(text="⭐ Апгрейд звезд", callback_data="game_upgrade")],
+        [InlineKeyboardButton(text="🗼 Башня (Риск)", callback_data="game_tower")]
     ])
-    await message.answer("🎮 <b>Выберите игру:</b>", parse_mode="HTML", reply_markup=kb)
+    await message.answer("🎮 <b>Выберите режим игры:</b>", parse_mode="HTML", reply_markup=kb)
 
-# --- Запуск Апгрейда Звезд из меню Игр ---
+# --- Режим 1: Апгрейд Звезд ---
 @router.callback_query(F.data == "game_upgrade")
 async def upgrade_stars_start(call: CallbackQuery, state: FSMContext):
     if await is_banned(call.from_user.id):
@@ -281,7 +321,6 @@ async def process_bet(message: Message, state: FSMContext):
         await message.answer(f"❌ У вас недостаточно звезд! Ваш баланс: {balance} ⭐.")
         return
 
-    # Получаем динамический шанс победы из базы
     chance = await get_win_chance()
     win = (random.randint(1, 100) <= chance)
 
@@ -317,6 +356,164 @@ async def process_bet(message: Message, state: FSMContext):
             )
 
     await state.clear()
+
+# --- Режим 2: Башня (Tower) ---
+@router.callback_query(F.data == "game_tower")
+async def tower_start(call: CallbackQuery, state: FSMContext):
+    if await is_banned(call.from_user.id):
+        return
+
+    user = await get_user(call.from_user.id)
+    balance = user[1]
+
+    if balance <= 0:
+        await call.message.answer("❌ У вас 0 звезд на балансе!")
+        await call.answer()
+        return
+
+    await state.set_state(TowerStates.waiting_for_bet)
+    await call.message.answer(
+        f"🗼 <b>Режим «Башня»</b>\n\n"
+        f"Правила: 4 ряда ступеней. В каждом ряду 3 ячейки: 2 с выигрышем и 1 ловушка. "
+        f"Если натыкаешься на ловушку — ставка сгорает полностью! С каждым шагом коэффициент растет.\n\n"
+        f"Ваш баланс: <b>{balance} ⭐</b>\n"
+        f"Введите ставку для входа в башню:"
+    , parse_mode="HTML")
+    await call.answer()
+
+@router.message(TowerStates.waiting_for_bet)
+async def tower_process_bet(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Введите число.")
+        return
+
+    bet = int(message.text)
+    user = await get_user(message.from_user.id)
+    balance = user[1]
+
+    if bet <= 0 or bet > balance:
+        await message.answer(f"❌ Некорректная ставка. Баланс: {balance} ⭐")
+        return
+
+    # Списываем ставку сразу
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (bet, message.from_user.id))
+        await db.commit()
+
+    # Сохраняем состояние игры в FSM (текущий ряд: 0, ставка: bet)
+    await state.update_data(tower_bet=bet, current_row=0, current_mult=1.0)
+    await show_tower_floor(message, state)
+
+async def show_tower_floor(message_or_call, state: FSMContext, is_callback=False):
+    data = await state.get_data()
+    row = data['current_row']
+    bet = data['tower_bet']
+    mult = data['current_mult']
+
+    # Коэффициенты для 4 рядов
+    multipliers = [1.4, 2.0, 3.0, 5.0]
+
+    if row >= 4:
+        # Победа на вершине башни!
+        final_win = int(bet * mult)
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute('UPDATE users SET balance = balance + ?, wins = wins + 1 WHERE user_id = ?', (final_win, message_or_call.from_user.id))
+            await db.commit()
+
+        text = (
+            f"👑 <b>ПОБЕДА НА ВЕРШИНЕ БАШНИ!</b>\n\n"
+            f"Вы прошли все ряды! Итоговый коэффициент: x{mult}\n"
+            f"Вы забираете <b>{final_win} ⭐</b>!"
+        )
+        if is_callback:
+            await message_or_call.message.edit_text(text, parse_mode="HTML")
+        else:
+            await message_or_call.answer(text, parse_mode="HTML")
+        await state.clear()
+        return
+
+    current_multiplier_step = multipliers[row]
+    text = (
+        f"🗼 <b>Башня — Ряд {row + 1} из 4</b>\n"
+        f"Ставка: {bet} ⭐ | Текущий множитель: x{mult}\n"
+        f"Следующий множитель при успехе: x{round(mult * current_multiplier_step, 1)}\n\n"
+        f"Выберите одну из 3 ячеек:"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚪 Ячейка 1", callback_data="tower_pick_0"),
+            InlineKeyboardButton(text="🚪 Ячейка 2", callback_data="tower_pick_1"),
+            InlineKeyboardButton(text="🚪 Ячейка 3", callback_data="tower_pick_2")
+        ]
+    ])
+    if row > 0:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=f"💰 Забрать выигрыш ({int(bet * mult)} ⭐)", callback_data="tower_cashout")])
+
+    if is_callback:
+        await message_or_call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await message_or_call.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@router.callback_query(F.data.startswith("tower_pick_"))
+async def tower_pick_cell(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data or 'tower_bet' not in data:
+        await call.answer("❌ Игра окончена или устарела.", show_alert=True)
+        return
+
+    row = data['current_row']
+    bet = data['tower_bet']
+    mult = data['current_mult']
+
+    # Из 3 ячеек одна случайно становится ловушкой (индекс 0, 1 или 2)
+    trap_index = random.randint(0, 2)
+    chosen_index = int(call.data.split("_")[2])
+
+    multipliers = [1.4, 2.0, 3.0, 5.0]
+
+    if chosen_index == trap_index:
+        # Ловушка! Хана, все сгорает
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute('UPDATE users SET losses = losses + 1 WHERE user_id = ?', (call.from_user.id,))
+            await db.commit()
+
+        await call.message.edit_text(
+            f"💥 <b>ЛОВУШКА! ВЫ ПРОИГРАЛИ ВСЁ!</b>\n\n"
+            f"Вы наткнулись на ловушку на ряду {row + 1}. Ваша ставка в {bet} ⭐ сгорела.",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        await call.answer()
+    else:
+        # Успех! Идем дальше
+        new_mult = round(mult * multipliers[row], 1)
+        await state.update_data(current_row=row + 1, current_mult=new_mult)
+        await call.answer("🎉 Успех! Поднимаемся выше!")
+        await show_tower_floor(call, state, is_callback=True)
+
+@router.callback_query(F.data == "tower_cashout")
+async def tower_cashout(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data or 'tower_bet' not in data:
+        await call.answer("❌ Игра не найдена.", show_alert=True)
+        return
+
+    bet = data['tower_bet']
+    mult = data['current_mult']
+    payout = int(bet * mult)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE users SET balance = balance + ?, wins = wins + 1 WHERE user_id = ?', (payout, call.from_user.id))
+        await db.commit()
+
+    await call.message.edit_text(
+        f"💰 <b>Досрочный вывод!</b>\n\n"
+        f"Вы забрали выигрыш с коэффициентом x{mult}. На ваш баланс начислено: <b>{payout} ⭐</b>",
+        parse_mode="HTML"
+    )
+    await state.clear()
+    await call.answer()
 
 # --- Вывод звезд (Пользователь) ---
 @router.callback_query(F.data == "withdraw_stars")
@@ -421,7 +618,7 @@ async def admin_panel(message: Message):
 
     role_title = "🔴 Старший админ" if role == "super" else "🔵 Младший админ"
     current_chance = await get_win_chance()
-    text = f"⚙️ <b>Панель администратора ({role_title}):</b>\n🎯 Текущий шанс победы: <b>{current_chance}%</b>"
+    text = f"⚙️ <b>Панель администратора ({role_title}):</b>\n🎯 Текущий шанс победы в Апгрейде: <b>{current_chance}%</b>"
 
     buttons = []
     if role == "super":
@@ -739,7 +936,8 @@ async def process_promo_stars(message: Message, state: FSMContext):
         await db.execute('INSERT OR REPLACE INTO promo_codes (code, activations_left, stars_reward) VALUES (?, ?, ?)', (name, acts, stars))
         await db.commit()
 
-    await message.answer(f"✅ Промокод <code>{name}</code> успешно создан!\nАктиваций: {acts}, Награда: {stars} ⭐", parse_mode="HTML")
+    await message.answer(f"✅ Промокод <code>{name}</code> успешно создан!
+Активаций: {acts}, Награда: {stars} ⭐", parse_mode="HTML")
     await state.clear()
 
 # Установить мин. вывод
@@ -748,7 +946,8 @@ async def admin_min_w_cb(call: CallbackQuery, state: FSMContext):
     if not await get_admin_role(call.from_user.id): return
     await state.set_state(AdminStates.waiting_for_min_withdraw)
     cur_min = await get_min_withdraw()
-    await call.message.answer(f"Текущий минимальный вывод: {cur_min} ⭐\nВведите новое значение минимального вывода:")
+    await call.message.answer(f"Текущий минимальный вывод: {cur_min} ⭐
+Введите новое значение минимального вывода:")
     await call.answer()
 
 @router.message(AdminStates.waiting_for_min_withdraw)
