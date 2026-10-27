@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: telegram-stars-casino-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_URL
+        value: "http://67.211.221.152:8888"
+      - key: PORT
+        value: "8080"

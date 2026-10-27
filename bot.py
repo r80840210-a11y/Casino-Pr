@@ -1,0 +1,639 @@
+import os
+import asyncio
+import logging
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
+)
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.client.session.aiohttp import AiohttpSession
+import random
+
+# Логирование
+logging.basicConfig(level=logging.INFO)
+
+# Конфигурация из переменных окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+CUSTOM_API_URL = os.getenv("TELEGRAM_API_URL", "http://67.211.221.152:8888")
+PORT = int(os.getenv("PORT", "8080"))
+INITIAL_ADMIN_ID = 1780243264
+DB_NAME = "casino_bot.db"
+
+# Инициализация бота с поддержкой Кастомного Сервера Телеграм
+session = AiohttpSession(
+    api=TelegramAPIServer.from_base(CUSTOM_API_URL, is_local=True)
+)
+bot = Bot(token=BOT_TOKEN, session=session)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
+# --- FSM Состояния ---
+class GameStates(StatesGroup):
+    waiting_for_bet = State()
+
+class WithdrawStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_address = State()
+
+class PromoStates(StatesGroup):
+    waiting_for_code = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_add_admin = State()
+    waiting_for_del_admin = State()
+    waiting_for_ban_user = State()
+    waiting_for_unban_user = State()
+    waiting_for_give_stars_user = State()
+    waiting_for_give_stars_amount = State()
+    waiting_for_take_stars_user = State()
+    waiting_for_take_stars_amount = State()
+    waiting_for_broadcast = State()
+    waiting_for_promo_name = State()
+    waiting_for_promo_activations = State()
+    waiting_for_promo_stars = State()
+    waiting_for_min_withdraw = State()
+
+# --- Работа с Базой Данных ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Пользователи
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0
+            )
+        ''')
+        # Админы
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        ''')
+        # Промокоды
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                code TEXT PRIMARY KEY,
+                activations_left INTEGER,
+                stars_reward INTEGER
+            )
+        ''')
+        # Промокоды, использованные пользователями
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS used_promos (
+                user_id INTEGER,
+                code TEXT,
+                PRIMARY KEY (user_id, code)
+            )
+        ''')
+        # Настройки (минимальный вывод и др.)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+
+        # Дефолтный админ
+        await db.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (INITIAL_ADMIN_ID,))
+        # Дефолтный минимальный вывод
+        await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('min_withdraw', '100'))
+        
+        await db.commit()
+
+async def is_admin(user_id: int) -> bool:
+    if user_id == INITIAL_ADMIN_ID:
+        return True
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def is_banned(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT is_banned FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] == 1 if row else False
+
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT user_id, balance, wins, losses, is_banned FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def register_user(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR IGNORE INTO users (user_id, balance, wins, losses, is_banned) VALUES (?, 0, 0, 0, 0)', (user_id,))
+        await db.commit()
+
+async def get_min_withdraw() -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT value FROM settings WHERE key = "min_withdraw"') as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 100
+
+# --- Главная Клавиатура ---
+def main_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⭐ Апгрейд звезд"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="💳 Задонатить звезды"), KeyboardButton(text="⚙️ Админ панель")]
+        ],
+        resize_keyboard=True
+    )
+
+# --- Обработчик /start ---
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    if await is_banned(message.from_user.id):
+        await message.answer("❌ Вы заблокированы в этом боте.")
+        return
+
+    await register_user(message.from_user.id)
+    
+    welcome_text = (
+        f"👋 Добро пожаловать в ⭐ Stars Casino!\n\n"
+        f"Здесь вы можете испытывать удачу и делать апгрейд звезд!\n"
+        f"Используйте меню ниже для навигации."
+    )
+    await message.answer(welcome_text, reply_markup=main_kb())
+
+# --- Вкладка Профиль ---
+@router.message(F.text == "👤 Профиль")
+async def profile_menu(message: Message):
+    if await is_banned(message.from_user.id):
+        return
+
+    user = await get_user(message.from_user.id)
+    if not user:
+        await register_user(message.from_user.id)
+        user = await get_user(message.from_user.id)
+
+    _, balance, wins, losses, _ = user
+
+    text = (
+        f"👤 <b>Ваш профиль:</b>\n\n"
+        f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
+        f"⭐ <b>Баланс звезд:</b> {balance} ⭐\n\n"
+        f"🏆 <b>Побед:</b> {wins}\n"
+        f"💥 <b>Поражений:</b> {losses}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Вывести звезды", callback_data="withdraw_stars")],
+        [InlineKeyboardButton(text="🎟 Активировать промокод", callback_data="activate_promo")]
+    ])
+
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+# --- Вкладка Задонатить Звезды ---
+@router.message(F.text == "💳 Задонатить звезды")
+async def donate_stars(message: Message):
+    if await is_banned(message.from_user.id):
+        return
+
+    text = (
+        "💳 <b>Пополнение баланса звезд:</b>\n\n"
+        "Чтобы задонатить звезды, напишите на этот юзернейм:\n"
+        "👉 <b>@v1nk_molik</b>\n\n"
+        "Укажите ваш ID и количество звезд, которое хотите приобрести, "
+        "и после оплаты они будут моментально начислены на ваш баланс!"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+# --- Вкладка Апгрейд Звезд (Казино) ---
+@router.message(F.text == "⭐ Апгрейд звезд")
+async def upgrade_stars_start(message: Message, state: FSMContext):
+    if await is_banned(message.from_user.id):
+        return
+
+    user = await get_user(message.from_user.id)
+    balance = user[1]
+
+    if balance <= 0:
+        await message.answer("❌ У вас 0 звезд на балансе! Задонатьте звезды через вкладку «💳 Задонатить звезды», чтобы начать играть.")
+        return
+
+    await state.set_state(GameStates.waiting_for_bet)
+    await message.answer(
+        f"🎰 <b>Апгрейд звезд</b>\n\n"
+        f"Ваш текущий баланс: <b>{balance} ⭐</b>\n\n"
+        f"Введите количество звезд, которое хотите поставить на апгрейд:"
+    , parse_mode="HTML")
+
+@router.message(GameStates.waiting_for_bet)
+async def process_bet(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Введите корректное число звезд.")
+        return
+
+    bet = int(message.text)
+    user = await get_user(message.from_user.id)
+    balance = user[1]
+
+    if bet <= 0:
+        await message.answer("❌ Ставка должна быть больше 0.")
+        return
+
+    if bet > balance:
+        await message.answer(f"❌ У вас недостаточно звезд! Ваш баланс: {balance} ⭐.")
+        return
+
+    # Логика подкрутки: шанс выигрыша 35% (больше проигрышей)
+    win = random.random() < 0.35
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        if win:
+            multiplier = 1.8
+            win_amount = int(bet * multiplier)
+            profit = win_amount - bet
+            await db.execute(
+                'UPDATE users SET balance = balance + ?, wins = wins + 1 WHERE user_id = ?',
+                (profit, message.from_user.id)
+            )
+            await db.commit()
+            new_balance = balance + profit
+            await message.answer(
+                f"🎉 <b>ПОБЕДА!</b>\n\n"
+                f"Вы выиграли {win_amount} ⭐ (x{multiplier})!\n"
+                f"Твой новый баланс: <b>{new_balance} ⭐</b>",
+                parse_mode="HTML"
+            )
+        else:
+            await db.execute(
+                'UPDATE users SET balance = balance - ?, losses = losses + 1 WHERE user_id = ?',
+                (bet, message.from_user.id)
+            )
+            await db.commit()
+            new_balance = balance - bet
+            await message.answer(
+                f"💥 <b>НЕУДАЧА!</b>\n\n"
+                f"Ваша ставка в {bet} ⭐ сгорела.\n"
+                f"Твой новый баланс: <b>{new_balance} ⭐</b>",
+                parse_mode="HTML"
+            )
+
+    await state.clear()
+
+# --- Вывод звезд ---
+@router.callback_query(F.data == "withdraw_stars")
+async def withdraw_start(call: CallbackQuery, state: FSMContext):
+    user = await get_user(call.from_user.id)
+    balance = user[1]
+    min_w = await get_min_withdraw()
+
+    if balance < min_w:
+        await call.answer(f"❌ Минимальный вывод: {min_w} ⭐. У вас: {balance} ⭐", show_alert=True)
+        return
+
+    await state.set_state(WithdrawStates.waiting_for_amount)
+    await call.message.answer(f"📤 Введите количество звезд для вывода (Минимум: {min_w} ⭐, Баланс: {balance} ⭐):")
+    await call.answer()
+
+@router.message(WithdrawStates.waiting_for_amount)
+async def process_withdraw_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Пожалуйста, введите число.")
+        return
+
+    amount = int(message.text)
+    user = await get_user(message.from_user.id)
+    balance = user[1]
+    min_w = await get_min_withdraw()
+
+    if amount < min_w:
+        await message.answer(f"❌ Минимальная сумма вывода составляет {min_w} ⭐.")
+        return
+
+    if amount > balance:
+        await message.answer(f"❌ У вас недостаточно звезд на балансе.")
+        return
+
+    await state.update_data(withdraw_amount=amount)
+    await state.set_state(WithdrawStates.waiting_for_address)
+    await message.answer("📝 Напишите ваш Telegram юзернейм или реквизиты для получения вывода:")
+
+@router.message(WithdrawStates.waiting_for_address)
+async def process_withdraw_address(message: Message, state: FSMContext):
+    address = message.text
+    data = await state.get_data()
+    amount = data['withdraw_amount']
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (amount, message.from_user.id))
+        await db.commit()
+
+    await message.answer(f"✅ Заявка на вывод {amount} ⭐ принята! Ожидайте обработки администратором.")
+    await state.clear()
+
+# --- Промокоды ---
+@router.callback_query(F.data == "activate_promo")
+async def promo_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoStates.waiting_for_code)
+    await call.message.answer("🎟 Введите название промокода:")
+    await call.answer()
+
+@router.message(PromoStates.waiting_for_code)
+async def process_promo(message: Message, state: FSMContext):
+    code = message.text.strip()
+    user_id = message.from_user.id
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Проверка, использовал ли уже
+        async with db.execute('SELECT 1 FROM used_promos WHERE user_id = ? AND code = ?', (user_id, code)) as cursor:
+            if await cursor.fetchone():
+                await message.answer("❌ Вы уже активировали этот промокод!")
+                await state.clear()
+                return
+
+        # Проверка существования промокода
+        async with db.execute('SELECT activations_left, stars_reward FROM promo_codes WHERE code = ?', (code,)) as cursor:
+            promo = await cursor.fetchone()
+
+        if not promo:
+            await message.answer("❌ Такого промокода не существует!")
+            await state.clear()
+            return
+
+        activations, reward = promo
+        if activations <= 0:
+            await message.answer("❌ У этого промокода закончились активации!")
+            await state.clear()
+            return
+
+        # Начисление
+        await db.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (reward, user_id))
+        await db.execute('UPDATE promo_codes SET activations_left = activations_left - 1 WHERE code = ?', (code,))
+        await db.execute('INSERT INTO used_promos (user_id, code) VALUES (?, ?)', (user_id, code))
+        await db.commit()
+
+    await message.answer(f"🎉 Промокод успешно активирован! Вам начислено <b>+{reward} ⭐</b>!", parse_mode="HTML")
+    await state.clear()
+
+# --- АДМИН ПАНЕЛЬ ---
+@router.message(F.text == "⚙️ Админ панель")
+async def admin_panel(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    text = "⚙️ <b>Панель администратора:</b>"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add"), InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_del")],
+        [InlineKeyboardButton(text="🚫 Забанить", callback_data="admin_ban"), InlineKeyboardButton(text="🟢 Разбанить", callback_data="admin_unban")],
+        [InlineKeyboardButton(text="➕ Выдать звезды", callback_data="admin_give"), InlineKeyboardButton(text="➖ Забрать звезды", callback_data="admin_take")],
+        [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_promo"), InlineKeyboardButton(text="⚙️ Мин. вывод", callback_data="admin_min_withdraw")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
+    ])
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+# Добавить админа
+@router.callback_query(F.data == "admin_add")
+async def admin_add_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_add_admin)
+    await call.message.answer("Введите ID пользователя для назначения админом:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_add_admin)
+async def process_admin_add(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
+    uid = int(message.text)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (uid,))
+        await db.commit()
+    await message.answer(f"✅ Пользователь {uid} назначен администратором.")
+    await state.clear()
+
+# Удалить админа
+@router.callback_query(F.data == "admin_del")
+async def admin_del_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_del_admin)
+    await call.message.answer("Введите ID админа для удаления:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_del_admin)
+async def process_admin_del(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
+    uid = int(message.text)
+    if uid == INITIAL_ADMIN_ID:
+        await message.answer("❌ Нельзя удалить главный ID!")
+        await state.clear()
+        return
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('DELETE FROM admins WHERE user_id = ?', (uid,))
+        await db.commit()
+    await message.answer(f"✅ Пользователь {uid} удален из админов.")
+    await state.clear()
+
+# Забанить
+@router.callback_query(F.data == "admin_ban")
+async def admin_ban_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_ban_user)
+    await call.message.answer("Введите ID пользователя для бана:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_ban_user)
+async def process_admin_ban(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
+    uid = int(message.text)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE users SET is_banned = 1 WHERE user_id = ?', (uid,))
+        await db.commit()
+    await message.answer(f"🚫 Пользователь {uid} забанен.")
+    await state.clear()
+
+# Разбанить
+@router.callback_query(F.data == "admin_unban")
+async def admin_unban_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_unban_user)
+    await call.message.answer("Введите ID пользователя для разбана:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_unban_user)
+async def process_admin_unban(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
+    uid = int(message.text)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE users SET is_banned = 0 WHERE user_id = ?', (uid,))
+        await db.commit()
+    await message.answer(f"🟢 Пользователь {uid} разбанен.")
+    await state.clear()
+
+# Выдать звезды
+@router.callback_query(F.data == "admin_give")
+async def admin_give_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_give_stars_user)
+    await call.message.answer("Введите ID пользователя для выдачи звезд:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_give_stars_user)
+async def process_give_user(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
+    await state.update_data(target_user=int(message.text))
+    await state.set_state(AdminStates.waiting_for_give_stars_amount)
+    await message.answer("Введите количество звезд для выдачи:")
+
+@router.message(AdminStates.waiting_for_give_stars_amount)
+async def process_give_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите число.")
+    amount = int(message.text)
+    data = await state.get_data()
+    uid = data['target_user']
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, uid))
+        await db.commit()
+
+    await message.answer(f"✅ Пользователю {uid} успешно выдано {amount} ⭐.")
+    await state.clear()
+
+# Забрать звезды
+@router.callback_query(F.data == "admin_take")
+async def admin_take_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_take_stars_user)
+    await call.message.answer("Введите ID пользователя для списания звезд:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_take_stars_user)
+async def process_take_user(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ ID должен состоять из цифр.")
+    await state.update_data(target_user=int(message.text))
+    await state.set_state(AdminStates.waiting_for_take_stars_amount)
+    await message.answer("Введите количество звезд для списания:")
+
+@router.message(AdminStates.waiting_for_take_stars_amount)
+async def process_take_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите число.")
+    amount = int(message.text)
+    data = await state.get_data()
+    uid = data['target_user']
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE users SET balance = MAX(0, balance - ?) WHERE user_id = ?', (amount, uid))
+        await db.commit()
+
+    await message.answer(f"✅ У пользователя {uid} списано {amount} ⭐.")
+    await state.clear()
+
+# Создание промокода
+@router.callback_query(F.data == "admin_promo")
+async def admin_promo_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_promo_name)
+    await call.message.answer("Введите название нового промокода:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_promo_name)
+async def process_promo_name(message: Message, state: FSMContext):
+    await state.update_data(promo_name=message.text.strip())
+    await state.set_state(AdminStates.waiting_for_promo_activations)
+    await message.answer("Введите количество активаций:")
+
+@router.message(AdminStates.waiting_for_promo_activations)
+async def process_promo_acts(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите число.")
+    await state.update_data(promo_acts=int(message.text))
+    await state.set_state(AdminStates.waiting_for_promo_stars)
+    await message.answer("Введите количество звезд за активацию:")
+
+@router.message(AdminStates.waiting_for_promo_stars)
+async def process_promo_stars(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите число.")
+    stars = int(message.text)
+    data = await state.get_data()
+    name = data['promo_name']
+    acts = data['promo_acts']
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR REPLACE INTO promo_codes (code, activations_left, stars_reward) VALUES (?, ?, ?)', (name, acts, stars))
+        await db.commit()
+
+    await message.answer(f"✅ Промокод <code>{name}</code> успешно создан!\nАктиваций: {acts}, Награда: {stars} ⭐", parse_mode="HTML")
+    await state.clear()
+
+# Установить мин. вывод
+@router.callback_query(F.data == "admin_min_withdraw")
+async def admin_min_w_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_min_withdraw)
+    cur_min = await get_min_withdraw()
+    await call.message.answer(f"Текущий минимальный вывод: {cur_min} ⭐\nВведите новое значение минимального вывода:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_min_withdraw)
+async def process_min_w(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("❌ Введите число.")
+    new_min = int(message.text)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("min_withdraw", ?)', (str(new_min),))
+        await db.commit()
+
+    await message.answer(f"✅ Минимальный вывод установлен на {new_min} ⭐.")
+    await state.clear()
+
+# Рассылка
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_cb(call: CallbackQuery, state: FSMContext):
+    if not await is_admin(call.from_user.id): return
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await call.message.answer("Введите сообщение для рассылки всем пользователям:")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    broadcast_text = message.text
+    count = 0
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT user_id FROM users WHERE is_banned = 0') as cursor:
+            users = await cursor.fetchall()
+
+    for user in users:
+        try:
+            await bot.send_message(user[0], broadcast_text)
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    await message.answer(f"📢 Рассылка завершена! Сообщение получили {count} пользователей.")
+    await state.clear()
+
+# --- Веб-сервер для прохождения Health Check на Render ---
+from aiohttp import web
+
+async def handle_health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+
+# --- Запуск Ботa ---
+async def main():
+    await init_db()
+    # Запуск веб-сервера для порта Render
+    asyncio.create_task(start_web_server())
+    # Старт поллинга бота
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
