@@ -59,6 +59,7 @@ class AdminStates(StatesGroup):
     waiting_for_promo_activations = State()
     waiting_for_promo_stars = State()
     waiting_for_min_withdraw = State()
+    waiting_for_win_chance = State()
 
 # --- Работа с Базой Данных ---
 async def init_db():
@@ -118,6 +119,8 @@ async def init_db():
         await db.execute('INSERT OR REPLACE INTO admins (user_id, role) VALUES (?, ?)', (INITIAL_ADMIN_ID, 'super'))
         # Мин. вывод по умолчанию
         await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('min_withdraw', '100'))
+        # Шанс победы по умолчанию (35%)
+        await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('win_chance', '35'))
         
         await db.commit()
 
@@ -150,6 +153,12 @@ async def get_min_withdraw() -> int:
         async with db.execute('SELECT value FROM settings WHERE key = "min_withdraw"') as cursor:
             row = await cursor.fetchone()
             return int(row[0]) if row else 100
+
+async def get_win_chance() -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT value FROM settings WHERE key = "win_chance"') as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 35
 
 # --- Главная Клавиатура ---
 def main_kb():
@@ -272,8 +281,9 @@ async def process_bet(message: Message, state: FSMContext):
         await message.answer(f"❌ У вас недостаточно звезд! Ваш баланс: {balance} ⭐.")
         return
 
-    # Логика подкрутки: шанс выигрыша 35%, множитель x2
-    win = random.random() < 0.35
+    # Получаем динамический шанс победы из базы
+    chance = await get_win_chance()
+    win = (random.randint(1, 100) <= chance)
 
     async with aiosqlite.connect(DB_NAME) as db:
         if win:
@@ -410,13 +420,17 @@ async def admin_panel(message: Message):
         return
 
     role_title = "🔴 Старший админ" if role == "super" else "🔵 Младший админ"
-    text = f"⚙️ <b>Панель администратора ({role_title}):</b>"
+    current_chance = await get_win_chance()
+    text = f"⚙️ <b>Панель администратора ({role_title}):</b>\n🎯 Текущий шанс победы: <b>{current_chance}%</b>"
 
     buttons = []
     if role == "super":
         buttons.append([
             InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add"),
             InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_del")
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="⚙️ Изменить шанс победы", callback_data="admin_win_chance")
         ])
 
     buttons.extend([
@@ -429,6 +443,37 @@ async def admin_panel(message: Message):
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+# Изменение процента побед (Только Старший админ)
+@router.callback_query(F.data == "admin_win_chance")
+async def admin_win_chance_cb(call: CallbackQuery, state: FSMContext):
+    role = await get_admin_role(call.from_user.id)
+    if role != "super":
+        await call.answer("❌ Функция доступна только Старшему Администратору!", show_alert=True)
+        return
+    
+    current_chance = await get_win_chance()
+    await state.set_state(AdminStates.waiting_for_win_chance)
+    await call.message.answer(f"🎯 Текущий шанс победы: <b>{current_chance}%</b>\n\nВведите новый процент побед (от 0 до 100):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(AdminStates.waiting_for_win_chance)
+async def process_win_chance(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("❌ Пожалуйста, введите число от 0 до 100.")
+        return
+
+    new_chance = int(message.text)
+    if not (0 <= new_chance <= 100):
+        await message.answer("❌ Процент должен быть в диапазоне от 0 до 100.")
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("win_chance", ?)', (str(new_chance),))
+        await db.commit()
+
+    await message.answer(f"✅ Шанс победы успешно изменен на <b>{new_chance}%</b>!", parse_mode="HTML")
+    await state.clear()
 
 # Просмотр заявок на вывод
 @router.callback_query(F.data == "admin_withdrawals_list")
