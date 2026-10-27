@@ -155,7 +155,7 @@ async def get_min_withdraw() -> int:
 def main_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⭐ Апгрейд звезд"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🎮 Играть"), KeyboardButton(text="👤 Профиль")],
             [KeyboardButton(text="💳 Задонатить звезды"), KeyboardButton(text="⚙️ Админ панель")]
         ],
         resize_keyboard=True
@@ -173,7 +173,7 @@ async def cmd_start(message: Message, state: FSMContext):
     
     welcome_text = (
         f"👋 Добро пожаловать в ⭐ Stars Casino!\n\n"
-        f"Здесь вы можете испытывать удачу и делать апгрейд звезд!\n"
+        f"Здесь вы можете испытывать удачу!\n"
         f"Используйте меню ниже для навигации."
     )
     await message.answer(welcome_text, reply_markup=main_kb())
@@ -221,25 +221,38 @@ async def donate_stars(message: Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# --- Вкладка Апгрейд Звезд (Казино х2) ---
-@router.message(F.text == "⭐ Апгрейд звезд")
-async def upgrade_stars_start(message: Message, state: FSMContext):
+# --- Меню Игр (Вкладка "Играть") ---
+@router.message(F.text == "🎮 Играть")
+async def games_menu(message: Message):
     if await is_banned(message.from_user.id):
         return
 
-    user = await get_user(message.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Апгрейд звезд", callback_data="game_upgrade")]
+    ])
+    await message.answer("🎮 <b>Выберите игру:</b>", parse_mode="HTML", reply_markup=kb)
+
+# --- Запуск Апгрейда Звезд из меню Игр ---
+@router.callback_query(F.data == "game_upgrade")
+async def upgrade_stars_start(call: CallbackQuery, state: FSMContext):
+    if await is_banned(call.from_user.id):
+        return
+
+    user = await get_user(call.from_user.id)
     balance = user[1]
 
     if balance <= 0:
-        await message.answer("❌ У вас 0 звезд на балансе! Задонатьте звезды через вкладку «💳 Задонатить звезды», чтобы начать играть.")
+        await call.message.answer("❌ У вас 0 звезд на балансе! Задонатьте звезды через вкладку «💳 Задонатить звезды», чтобы начать играть.")
+        await call.answer()
         return
 
     await state.set_state(GameStates.waiting_for_bet)
-    await message.answer(
+    await call.message.answer(
         f"🎰 <b>Апгрейд звезд (Множитель x2)</b>\n\n"
         f"Ваш текущий баланс: <b>{balance} ⭐</b>\n\n"
         f"Введите количество звезд, которое хотите поставить на апгрейд:"
     , parse_mode="HTML")
+    await call.answer()
 
 @router.message(GameStates.waiting_for_bet)
 async def process_bet(message: Message, state: FSMContext):
@@ -341,7 +354,6 @@ async def process_withdraw_address(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Списываем звезды с баланса сразу, чтобы не проиграл их пока ждет
         await db.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (amount, user_id))
         await db.execute('INSERT INTO withdrawals (user_id, amount, address, status) VALUES (?, ?, ?, "pending")', (user_id, amount, address))
         await db.commit()
@@ -478,7 +490,6 @@ async def process_withdrawal_action(call: CallbackQuery):
             except Exception:
                 pass
         elif action == "reject":
-            # Возвращаем звезды пользователю
             await db.execute('UPDATE withdrawals SET status = "rejected" WHERE id = ?', (req_id,))
             await db.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, uid))
             await db.commit()
