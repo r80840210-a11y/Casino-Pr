@@ -73,11 +73,21 @@ async def init_db():
                 is_banned INTEGER DEFAULT 0
             )
         ''')
-        # Админы с уровнем доступа (super = старший, junior = младший)
+        # Админы с ролями (super / junior)
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
                 role TEXT DEFAULT 'junior'
+            )
+        ''')
+        # Заявки на вывод
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount INTEGER,
+                address TEXT,
+                status TEXT DEFAULT 'pending'
             )
         ''')
         # Промокоды
@@ -88,7 +98,7 @@ async def init_db():
                 stars_reward INTEGER
             )
         ''')
-        # Промокоды, использованные пользователями
+        # Использованные промокоды
         await db.execute('''
             CREATE TABLE IF NOT EXISTS used_promos (
                 user_id INTEGER,
@@ -96,7 +106,7 @@ async def init_db():
                 PRIMARY KEY (user_id, code)
             )
         ''')
-        # Настройки (минимальный вывод и др.)
+        # Настройки
         await db.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -104,9 +114,9 @@ async def init_db():
             )
         ''')
 
-        # Главный админ (всегда super)
+        # Главный админ
         await db.execute('INSERT OR REPLACE INTO admins (user_id, role) VALUES (?, ?)', (INITIAL_ADMIN_ID, 'super'))
-        # Дефолтный минимальный вывод
+        # Мин. вывод по умолчанию
         await db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('min_withdraw', '100'))
         
         await db.commit()
@@ -249,7 +259,7 @@ async def process_bet(message: Message, state: FSMContext):
         await message.answer(f"❌ У вас недостаточно звезд! Ваш баланс: {balance} ⭐.")
         return
 
-    # Логика подкрутки: шанс выигрыша 35% (больше проигрышей), множитель x2
+    # Логика подкрутки: шанс выигрыша 35%, множитель x2
     win = random.random() < 0.35
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -285,7 +295,7 @@ async def process_bet(message: Message, state: FSMContext):
 
     await state.clear()
 
-# --- Вывод звезд ---
+# --- Вывод звезд (Пользователь) ---
 @router.callback_query(F.data == "withdraw_stars")
 async def withdraw_start(call: CallbackQuery, state: FSMContext):
     user = await get_user(call.from_user.id)
@@ -328,12 +338,15 @@ async def process_withdraw_address(message: Message, state: FSMContext):
     address = message.text
     data = await state.get_data()
     amount = data['withdraw_amount']
+    user_id = message.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (amount, message.from_user.id))
+        # Списываем звезды с баланса сразу, чтобы не проиграл их пока ждет
+        await db.execute('UPDATE users SET balance = balance - ? WHERE user_id = ?', (amount, user_id))
+        await db.execute('INSERT INTO withdrawals (user_id, amount, address, status) VALUES (?, ?, ?, "pending")', (user_id, amount, address))
         await db.commit()
 
-    await message.answer(f"✅ Заявка на вывод {amount} ⭐ принята! Ожидайте обработки администратором.")
+    await message.answer(f"✅ Заявка на вывод {amount} ⭐ успешно создана и передана администраторам!")
     await state.clear()
 
 # --- Промокоды ---
@@ -349,14 +362,12 @@ async def process_promo(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Проверка, использовал ли уже
         async with db.execute('SELECT 1 FROM used_promos WHERE user_id = ? AND code = ?', (user_id, code)) as cursor:
             if await cursor.fetchone():
                 await message.answer("❌ Вы уже активировали этот промокод!")
                 await state.clear()
                 return
 
-        # Проверка существования промокода
         async with db.execute('SELECT activations_left, stars_reward FROM promo_codes WHERE code = ?', (code,)) as cursor:
             promo = await cursor.fetchone()
 
@@ -371,7 +382,6 @@ async def process_promo(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        # Начисление
         await db.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (reward, user_id))
         await db.execute('UPDATE promo_codes SET activations_left = activations_left - 1 WHERE code = ?', (code,))
         await db.execute('INSERT INTO used_promos (user_id, code) VALUES (?, ?)', (user_id, code))
@@ -380,7 +390,7 @@ async def process_promo(message: Message, state: FSMContext):
     await message.answer(f"🎉 Промокод успешно активирован! Вам начислено <b>+{reward} ⭐</b>!", parse_mode="HTML")
     await state.clear()
 
-# --- АДМИН ПАНЕЛЬ С РОЛЯМИ (Старший / Младший) ---
+# --- АДМИН ПАНЕЛЬ С РОЛЯМИ ---
 @router.message(F.text == "⚙️ Админ панель")
 async def admin_panel(message: Message):
     role = await get_admin_role(message.from_user.id)
@@ -398,6 +408,7 @@ async def admin_panel(message: Message):
         ])
 
     buttons.extend([
+        [InlineKeyboardButton(text="📤 Заявки на вывод", callback_data="admin_withdrawals_list")],
         [InlineKeyboardButton(text="🚫 Забанить", callback_data="admin_ban"), InlineKeyboardButton(text="🟢 Разбанить", callback_data="admin_unban")],
         [InlineKeyboardButton(text="➕ Выдать звезды", callback_data="admin_give"), InlineKeyboardButton(text="➖ Забрать звезды", callback_data="admin_take")],
         [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_promo"), InlineKeyboardButton(text="⚙️ Мин. вывод", callback_data="admin_min_withdraw")],
@@ -407,14 +418,84 @@ async def admin_panel(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
-# Выбор роли при добавлении админа (Доступно только Старшему Админу)
-@router.callback_query(F.data == "admin_add")
-async def admin_add_cb(call: CallbackQuery, state: FSMContext):
-    role = await get_admin_role(call.from_user.id)
-    if role != "super":
-        await call.answer("❌ Функция доступна только Старшему Администратору!", show_alert=True)
+# Просмотр заявок на вывод
+@router.callback_query(F.data == "admin_withdrawals_list")
+async def admin_withdrawals_list(call: CallbackQuery):
+    if not await get_admin_role(call.from_user.id): return
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT id, user_id, amount, address FROM withdrawals WHERE status = "pending" LIMIT 5') as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await call.answer("📭 Активных заявок на вывод нет.", show_alert=True)
         return
 
+    await call.message.answer("📤 <b>Список ожидающих заявок на вывод:</b>", parse_mode="HTML")
+    for req_id, uid, amount, address in rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"wd_accept_{req_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"wd_reject_{req_id}")
+            ]
+        ])
+        text = (
+            f"🆔 Заявка №<code>{req_id}</code>\n"
+            f"👤 ID игрока: <code>{uid}</code>\n"
+            f"⭐ Сумма: <b>{amount} ⭐</b>\n"
+            f"📝 Реквизиты: {address}"
+        )
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+# Обработка заявки (Принять / Отклонить)
+@router.callback_query(F.data.startswith("wd_"))
+async def process_withdrawal_action(call: CallbackQuery):
+    if not await get_admin_role(call.from_user.id): return
+    
+    action, req_id_str = call.data.split("_")[1], call.data.split("_")[2]
+    req_id = int(req_id_str)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT user_id, amount, status FROM withdrawals WHERE id = ?', (req_id,)) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            await call.message.edit_text("❌ Заявка не найдена или уже обработана.")
+            return
+
+        uid, amount, status = row
+        if status != "pending":
+            await call.message.edit_text("❌ Эта заявка уже была обработана ранее.")
+            return
+
+        if action == "accept":
+            await db.execute('UPDATE withdrawals SET status = "accepted" WHERE id = ?', (req_id,))
+            await db.commit()
+            await call.message.edit_text(f"✅ Заявка №{req_id} <b>принята</b> администратором.", parse_mode="HTML")
+            try:
+                await bot.send_message(uid, f"✅ Ваша заявка на вывод <b>{amount} ⭐</b> успешно выплачена администратором!", parse_mode="HTML")
+            except Exception:
+                pass
+        elif action == "reject":
+            # Возвращаем звезды пользователю
+            await db.execute('UPDATE withdrawals SET status = "rejected" WHERE id = ?', (req_id,))
+            await db.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, uid))
+            await db.commit()
+            await call.message.edit_text(f"❌ Заявка №{req_id} <b>отклонена</b>, звезды возвращены игроку.", parse_mode="HTML")
+            try:
+                await bot.send_message(uid, f"❌ Ваша заявка на вывод <b>{amount} ⭐</b> была отклонена администратором. Звезды возвращены на ваш баланс.", parse_mode="HTML")
+            except Exception:
+                pass
+
+    await call.answer()
+
+# Добавить админа
+@router.callback_query(F.data == "admin_add")
+async def admin_add_cb(call: CallbackQuery, state: FSMContext):
+    if await get_admin_role(call.from_user.id) != "super":
+        await call.answer("❌ Функция доступна только Старшему Администратору!", show_alert=True)
+        return
     await state.set_state(AdminStates.waiting_for_add_admin_id)
     await call.message.answer("Введите ID пользователя для назначения админом:")
     await call.answer()
@@ -451,14 +532,12 @@ async def process_admin_role_select(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.answer()
 
-# Удалить админа (Доступно только Старшему Админу)
+# Удалить админа
 @router.callback_query(F.data == "admin_del")
 async def admin_del_cb(call: CallbackQuery, state: FSMContext):
-    role = await get_admin_role(call.from_user.id)
-    if role != "super":
+    if await get_admin_role(call.from_user.id) != "super":
         await call.answer("❌ Функция доступна только Старшему Администратору!", show_alert=True)
         return
-
     await state.set_state(AdminStates.waiting_for_del_admin)
     await call.message.answer("Введите ID админа для удаления:")
     await call.answer()
@@ -673,9 +752,7 @@ async def start_web_server():
 # --- Запуск Ботa ---
 async def main():
     await init_db()
-    # Запуск веб-сервера для порта Render
     asyncio.create_task(start_web_server())
-    # Старт поллинга бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
