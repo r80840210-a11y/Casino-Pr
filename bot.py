@@ -394,7 +394,8 @@ async def tower_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(TowerStates.waiting_for_bet)
     await call.message.answer(
         f"🗼 <b>Режим «Башня» (8 рядов)</b>\n\n"
-        f"Правила: 8 рядов ступеней. В каждом ряду 3 ячейки: 2 с выигрышем и 1 ловушка. "
+        f"Правила: 8 рядов ступеней. В каждом ряду 3 ячейки. "
+        f"Шанс успешного прохода ряда зависит от настроек шанса победы в боте. "
         f"Если дойдете до 8 ряда — сорвете огромный куш! Но если наткнетесь на ловушку — ставка сгорит полностью!\n\n"
         f"Ваш баланс: <b>{balance} ⭐</b>\n"
         f"Введите ставку для входа в башню:"
@@ -484,9 +485,19 @@ async def tower_pick_cell(call: CallbackQuery, state: FSMContext):
     row = data['current_row']
     bet = data['tower_bet']
     mult = data['current_mult']
-
-    trap_index = random.randint(0, 2)
     chosen_index = int(call.data.split("_")[2])
+
+    # ИСПОЛЬЗУЕМ ГЛОБАЛЬНЫЙ ПРОЦЕНТ ПОБЕД (win_chance) ТАКЖЕ И ДЛЯ БАШНИ
+    chance = await get_win_chance()
+    success = (random.randint(1, 100) <= chance)
+
+    if not success:
+        # Ловушка попадает прямо на выбранную ячейку игрока
+        trap_index = chosen_index
+    else:
+        # Успех: ловушка размещается в одной из двух других ячеек
+        other_indices = [i for i in range(3) if i != chosen_index]
+        trap_index = random.choice(other_indices)
 
     multipliers = [1.25, 1.5, 1.8, 2.2, 2.8, 3.5, 5.0, 8.0]
 
@@ -497,7 +508,7 @@ async def tower_pick_cell(call: CallbackQuery, state: FSMContext):
             await db.commit()
 
         await call.message.edit_text(
-            f"💥 <b>ПРИЗ ПОТУХ! ЛОВУШКА НА 8 РЯДУ!</b>\n\n"
+            f"💥 <b>ПРИЗ ПОТУХ! ЛОВУШКА НА РЯДУ {row + 1}!</b>\n\n"
             f"Вы наткнулись на ловушку на ряду {row + 1}. Ваша ставка в {bet} ⭐ сгорела.",
             parse_mode="HTML"
         )
@@ -635,7 +646,7 @@ async def admin_panel(message: Message):
 
     role_title = "🔴 Старший админ" if role == "super" else "🔵 Младший админ"
     current_chance = await get_win_chance()
-    text = f"⚙️ <b>Панель администратора ({role_title}):</b>\n🎯 Текущий шанс победы в Апгрейде: <b>{current_chance}%</b>"
+    text = f"⚙️ <b>Панель администратора ({role_title}):</b>\n🎯 Текущий шанс победы (Апгрейд и Башня): <b>{current_chance}%</b>"
 
     buttons = []
     if role == "super":
@@ -685,7 +696,7 @@ async def process_win_chance(message: Message, state: FSMContext):
         await db.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("win_chance", ?)', (str(new_chance),))
         await db.commit()
 
-    await message.answer(f"✅ Шанс победы успешно изменен на <b>{new_chance}%</b>!", parse_mode="HTML")
+    await message.answer(f"✅ Шанс победы успешно изменен на <b>{new_chance}%</b> (теперь применяется и к Башне)!", parse_mode="HTML")
     await state.clear()
 
 @router.callback_query(F.data == "admin_withdrawals_list")
