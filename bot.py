@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 # Токен берется из переменных окружения Render (Environment Variables -> BOT_TOKEN)
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("1780243382:h5mO5A_HqR67UQfRhr-J4ZBmmIDkcydtMY2")
 
 SERVER_IP = "67.211.221.152"
 SERVER_PORT = 8888
