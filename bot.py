@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 # Твой токен уже прописан прямо здесь, ошибки с переменными больше не будет
-TOKEN = "1780243383:8pd9P5LHXvqwS1Fb6Lb1M4H52cPh5IN3vXi"
+TOKEN = "9059463650:AAEj4yWPYBxBubpk9Vzgf4UPBjD2-bNjAEo"
 
 SERVER_IP = "67.211.221.152"
 SERVER_PORT = 8888
