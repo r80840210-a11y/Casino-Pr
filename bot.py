@@ -218,4 +218,9 @@ async def health():
 
 # ---------- Точка входа ----------
 if __name__ == "__main__":
-    uvicorn.run(web, host="0.0.0.0", port=PORT)
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    try:
+        uvicorn.run(web, host="0.0.0.0", port=PORT)
+    except Exception as e:
+        print(f"Критическая ошибка при запуске: {e}")
