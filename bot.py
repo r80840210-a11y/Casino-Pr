@@ -3,15 +3,16 @@ import os
 import sqlite3
 import aiohttp
 import uvicorn
+import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ChatAction
+from aiogram.types import Message
+from aiogram.enums import ChatAction, ParseMode  # <-- ИСПРАВЛЕНО: ChatAction теперь здесь
 from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 
 # ---------- Конфиг из переменных окружения ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -168,7 +169,7 @@ async def build_report(user) -> str:
 # ---------- Хендлеры ----------
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    await bot.send_chat_action(message.chat.id, ChatAction.TYPING) # Теперь работает
     report = await build_report(message.from_user)
     await message.answer(report)
 
@@ -218,7 +219,6 @@ async def health():
 
 # ---------- Точка входа ----------
 if __name__ == "__main__":
-    import logging
     logging.basicConfig(level=logging.INFO)
     try:
         uvicorn.run(web, host="0.0.0.0", port=PORT)
