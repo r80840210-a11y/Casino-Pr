@@ -27,25 +27,19 @@ dp = Dispatcher()
 db = sqlite3.connect("osint.db", check_same_thread=False)
 db.execute("""CREATE TABLE IF NOT EXISTS name_history(
     user_id INTEGER, name TEXT, username TEXT, ts TEXT)""")
-db.execute("""CREATE TABLE IF NOT EXISTS known_chats(
-    chat_id INTEGER PRIMARY KEY, title TEXT)""")
 db.commit()
 
 def save_name(uid, name, username):
-    # Проверяем, изменилось ли имя, чтобы не спамить одинаковыми записями
     cur = db.execute("SELECT name, username FROM name_history WHERE user_id=? ORDER BY ts DESC LIMIT 1", (uid,))
     last = cur.fetchone()
     if last and last[0] == name and last[1] == (username or ""):
-        return # Имя не изменилось, не записываем
-    
+        return
     db.execute("INSERT INTO name_history VALUES(?,?,?,?)",
                (uid, name, username or "", datetime.now().isoformat()))
     db.commit()
 
 def get_name_history(uid):
-    cur = db.execute(
-        "SELECT name, username, ts FROM name_history WHERE user_id=? ORDER BY ts",
-        (uid,))
+    cur = db.execute("SELECT name, username, ts FROM name_history WHERE user_id=? ORDER BY ts", (uid,))
     return cur.fetchall()
 
 # ---------- Блоки отчёта ----------
@@ -78,8 +72,7 @@ PLATFORMS = {
     "GitHub": "https://github.com/{}", "Instagram": "https://instagram.com/{}",
     "TikTok": "https://tiktok.com/@{}", "Twitter/X": "https://x.com/{}",
     "YouTube": "https://youtube.com/@{}", "Reddit": "https://reddit.com/user/{}",
-    "Steam": "https://steamcommunity.com/id/{}", "Pinterest": "https://pinterest.com/{}",
-    "Twitch": "https://twitch.tv/{}", "VK": "https://vk.com/{}",
+    "Steam": "https://steamcommunity.com/id/{}", "VK": "https://vk.com/{}",
     "Habr": "https://habr.com/ru/users/{}/", "Flickr": "https://flickr.com/people/{}",
 }
 
@@ -92,11 +85,14 @@ async def osint_block(username: str) -> str:
         for name, url_tpl in PLATFORMS.items():
             url = url_tpl.format(username)
             try:
-                async with s.head(url, allow_redirects=True) as r:
-                    status = "✅" if r.status == 200 else "❌"
-                    text += f"{status} {name}: {url}\n"
+                # Используем GET вместо HEAD, так как некоторые сайты блокируют HEAD
+                async with s.get(url, allow_redirects=True) as r:
+                    if r.status == 200:
+                        text += f"✅ {name}: {url}\n"
+                    else:
+                        text += f"❌ {name}: не найден\n"
             except Exception:
-                text += f"⚠️ {name}: ошибка\n"
+                text += f"⚠️ {name}: ошибка проверки\n"
     return text
 
 async def build_report(user) -> str:
@@ -111,42 +107,25 @@ async def build_report(user) -> str:
 async def cmd_start(message: Message):
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     report = await build_report(message.from_user)
-    await message.answer(report + "\n\n<i>💡 Чтобы пробить другого человека, отправь мне его @username (например: @durov)</i>")
+    await message.answer(report + "\n\n<i>💡 Отправь мне @username, чтобы проверить соцсети.</i>")
 
-# ---------- ПОИСК ПО USERNAME БЕЗ ГРУПП ----------
+# ---------- ПОИСК ПО USERNAME (БЕЗ ОШИБКИ CHAT NOT FOUND) ----------
 @dp.message(F.text.startswith("@") | F.text.startswith("https://t.me/") | F.text.startswith("t.me/"))
 async def search_by_username(message: Message):
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     
-    # Очищаем ввод, чтобы получить чистый юзернейм
     raw = message.text.replace("https://t.me/", "").replace("t.me/", "").replace("@", "").strip()
     
-    try:
-        # Запрашиваем инфу о юзере через Telegram API
-        chat = await bot.get_chat(f"@{raw}")
-        
-        # Бот может получить полную инфу только если юзер есть в базе Telegram API
-        if chat.type != "private":
-            await message.answer("❌ Это не пользователь, а канал или группа.")
-            return
-
-        save_name(chat.id, f"{chat.first_name or ''} {chat.last_name or ''}".strip(), chat.username)
-        
-        report = (
-            f"👤 <b>ПРОФИЛЬ (по нику)</b>\n"
-            f"🆔 ID: <code>{chat.id}</code>\n"
-            f"📛 Имя: {chat.first_name} {chat.last_name or ''}\n"
-            f"🔗 Username: @{chat.username}\n"
-            f"🖼 Фото: {'Есть' if chat.photo else 'Нет'}\n"
-            f"💎 Premium: {'Да' if getattr(chat, 'is_premium', False) else 'Нет'}\n"
-        )
-        report += "\n" + history_block(chat.id)
-        report += "\n" + await osint_block(chat.username)
-        
-        await message.answer(report)
-        
-    except Exception as e:
-        await message.answer(f"❌ Не удалось найти пользователя @{raw}.\nОшибка: <code>{e}</code>")
+    # Мы не делаем запрос get_chat, так как он падает. Мы просто запускаем OSINT по нику.
+    report = (
+        f"🔍 <b>РЕЗУЛЬТАТЫ ПОИСКА ПО НИКУ: @{raw}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<i>База Telegram скрыта (юзернейм не найден в кэше бота). Ниже результаты проверки соцсетей:</i>\n\n"
+    )
+    report += await osint_block(raw)
+    report += "\n\n💡 <i>Если это ваш ник, нажмите /start, чтобы бот сохранил ваши данные.</i>"
+    
+    await message.answer(report)
 
 @dp.message(Command("target"))
 async def cmd_target(message: Message):
