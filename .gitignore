@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+osint.db
+/tmp/
+avatar_*.jpg
+.venv/
+venv/
+*.log
